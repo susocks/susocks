@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"github.com/gorilla/websocket"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 )
 
@@ -14,9 +16,11 @@ func init() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Llongfile)
 }
 
+var addr = flag.String("url", "wss://susocks.if.run/susocks", "susocks url")
+var bind = flag.String("bind", "127.0.0.1:1080", "socks5 bind ip:port")
+var basicAuth = flag.String("auth", "user:password", "basic auth")
+
 func main() {
-	var addr = flag.String("url", "wss://susocks.if.run/susocks", "susocks url")
-	var bind = flag.String("bind", "127.0.0.1:1080", "socks5 bind ip:port")
 	flag.Parse()
 
 	//interrupt := make(chan os.Signal, 1)
@@ -49,7 +53,9 @@ func main() {
 
 func process(url2 *url.URL, conn net.Conn) {
 	log.Printf("connecting to %s", url2.String())
-	c, _, err := websocket.DefaultDialer.Dial(url2.String(), nil)
+
+	c, _, err := websocket.DefaultDialer.Dial(url2.String(),
+		http.Header{"Authorization": []string{"Basic " + base64.StdEncoding.EncodeToString([]byte(*basicAuth))}})
 	if err != nil {
 		log.Print("dial:", err.Error())
 		conn.Close()

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"errors"
 	"flag"
 	"github.com/gorilla/websocket"
@@ -15,9 +16,10 @@ func init() {
 }
 
 var rAddr net.Addr
+var addr = flag.String("addr", "0.0.0.0:80", "http service address")
+var basicAuth = flag.String("auth", "user:password", "basic auth")
 
 func main() {
-	var addr = flag.String("addr", "0.0.0.0:80", "http service address")
 	var err error
 	flag.Parse()
 	rAddr, err = GetIntranetIp()
@@ -31,6 +33,14 @@ func main() {
 
 func susocksHandler(responseWriter http.ResponseWriter, request *http.Request) {
 	log.Print("got request from ", request.RemoteAddr)
+	auths := request.Header["Authorization"]
+	if len(auths) != 1 || auths[0] != "Basic "+base64.StdEncoding.EncodeToString([]byte(*basicAuth)) {
+		log.Print("auth failed")
+		responseWriter.WriteHeader(403)
+		responseWriter.Write([]byte{})
+		return
+	}
+	log.Print("auth success")
 	ws := &websocket.Upgrader{}
 	c, err := ws.Upgrade(responseWriter, request, nil)
 	if err != nil {
