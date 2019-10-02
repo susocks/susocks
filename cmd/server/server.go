@@ -71,7 +71,6 @@ func (conn SConn) Read(b []byte) (n int, err error) {
 		log.Print(err.Error())
 		return 0, err
 	}
-	//utils.Debug("mtp:",mtp)
 	//log.Print("read message:",message)
 	for i, m := range message {
 		b[i] = m

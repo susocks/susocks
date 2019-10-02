@@ -10,15 +10,20 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 )
 
-func init() {
-	log.SetFlags(log.Ldate | log.Ltime | log.Llongfile)
-}
+const (
+	IDLE = 6
+)
 
 var addr = flag.String("url", "wss://susocks.if.run/susocks", "susocks url")
 var bind = flag.String("bind", "127.0.0.1:1080", "socks5 bind ip:port")
 var basicAuth = flag.String("auth", "user:password", "basic auth")
+
+func init() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Llongfile)
+}
 
 func main() {
 	flag.Parse()
@@ -36,7 +41,7 @@ func main() {
 		fmt.Printf("listen fail, err: %v\n", err)
 		return
 	}
-
+	connPoll := NewConnPool(u)
 	//2.accept client request
 	//3.create goroutine for each request
 	for {
@@ -47,17 +52,69 @@ func main() {
 		}
 
 		//create goroutine for each connect
-		go process(u, conn)
+		go process(connPoll.Popup(), conn)
 	}
 }
 
-func process(url2 *url.URL, conn net.Conn) {
-	log.Printf("connecting to %s", url2.String())
+type ConnPool struct {
+	u     *url.URL
+	Conns []*websocket.Conn
+	mutex *sync.Mutex
+}
 
-	c, _, err := websocket.DefaultDialer.Dial(url2.String(),
+func NewConnPool(url2 *url.URL) *ConnPool {
+	pool := &ConnPool{Conns: []*websocket.Conn{}, mutex: new(sync.Mutex), u: url2}
+	for i := 0; i < 10; i++ {
+		go pool.NewConn()
+	}
+	return pool
+}
+
+func (connPool *ConnPool) Popup() *websocket.Conn {
+	connPool.mutex.Lock()
+	if len(connPool.Conns) == 0 {
+		connPool.mutex.Unlock()
+		conn, err := NewConn(connPool.u)
+		if err != nil {
+			return nil
+		}
+		return conn
+	}
+	first := connPool.Conns[0]
+	connPool.Conns = connPool.Conns[1:]
+	connPool.mutex.Unlock()
+	go connPool.NewConn()
+	return first
+}
+
+func (connPool *ConnPool) NewConn() error {
+	log.Printf("connecting to %s", connPool.u.String())
+	c, _, err := websocket.DefaultDialer.Dial(connPool.u.String(),
 		http.Header{"Authorization": []string{"Basic " + base64.StdEncoding.EncodeToString([]byte(*basicAuth))}})
 	if err != nil {
 		log.Print("dial:", err.Error())
+		return err
+	}
+	connPool.mutex.Lock()
+	defer connPool.mutex.Unlock()
+	connPool.Conns = append(connPool.Conns, c)
+	return nil
+}
+
+func NewConn(u *url.URL) (*websocket.Conn, error) {
+	log.Printf("connecting to %s", u.String())
+	c, _, err := websocket.DefaultDialer.Dial(u.String(),
+		http.Header{"Authorization": []string{"Basic " + base64.StdEncoding.EncodeToString([]byte(*basicAuth))}})
+	if err != nil {
+		log.Print("dial:", err.Error())
+		return nil, err
+	}
+	return c, nil
+}
+
+func process(c *websocket.Conn, conn net.Conn) {
+	if c == nil {
+		log.Print("websocket.Conn is nil")
 		conn.Close()
 		return
 	}
@@ -74,7 +131,6 @@ func process(url2 *url.URL, conn net.Conn) {
 				log.Print(err)
 				return
 			}
-			//utils.Debug("got bytes from user:",data[:n])
 			select {
 			case csChan <- data[:n]:
 			case <-ctx.Done():
@@ -90,7 +146,6 @@ func process(url2 *url.URL, conn net.Conn) {
 				log.Print(err.Error())
 				return
 			}
-			//utils.Debug("got bytes from server:",data)
 			select {
 			case scChan <- data:
 			case <-ctx.Done():
@@ -106,7 +161,6 @@ func process(url2 *url.URL, conn net.Conn) {
 				conn.Close()
 				return
 			case data := <-csChan:
-				//utils.Debug("sending bytes to server:",data)
 				err := c.WriteMessage(websocket.BinaryMessage, data)
 				if err != nil {
 					cancelFunc()
@@ -114,14 +168,12 @@ func process(url2 *url.URL, conn net.Conn) {
 					return
 				}
 			case data := <-scChan:
-				//utils.Debug("sending bytes to user:",data)
 				_, err := conn.Write(data)
 				if err != nil {
 					cancelFunc()
 					log.Print(err.Error())
 					return
 				}
-				//utils.Debug("sended byte",data,n)
 			}
 		}
 	}()

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"golang.org/x/net/context"
-	"if.run/tuotoo/utils"
 	"log"
 	"net"
 	"os"
@@ -119,7 +118,6 @@ func (s *Server) Serve(l net.Listener) error {
 
 // ServeConn is used to serve a single connection.
 func (s *Server) ServeConn(conn SuConner) error {
-	utils.Debug("ServeConn", conn.RemoteAddr().String())
 	defer conn.Close()
 	bufConn := bufio.NewReader(conn)
 
@@ -129,7 +127,6 @@ func (s *Server) ServeConn(conn SuConner) error {
 		s.config.Logger.Printf("[ERR] socks: Failed to get version byte: %v", err)
 		return err
 	}
-	utils.Debug("version", version)
 	// Ensure we are compatible
 	if version[0] != Socks5Version {
 		err := fmt.Errorf("Unsupported SOCKS version: %v", version)
