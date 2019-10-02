@@ -88,16 +88,13 @@ func (connPool *ConnPool) Popup() *websocket.Conn {
 }
 
 func (connPool *ConnPool) NewConn() error {
-	log.Printf("connecting to %s", connPool.u.String())
-	c, _, err := websocket.DefaultDialer.Dial(connPool.u.String(),
-		http.Header{"Authorization": []string{"Basic " + base64.StdEncoding.EncodeToString([]byte(*basicAuth))}})
+	c, err := NewConn(connPool.u)
 	if err != nil {
-		log.Print("dial:", err.Error())
 		return err
 	}
 	connPool.mutex.Lock()
-	defer connPool.mutex.Unlock()
 	connPool.Conns = append(connPool.Conns, c)
+	connPool.mutex.Unlock()
 	return nil
 }
 
