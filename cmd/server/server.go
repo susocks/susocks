@@ -47,6 +47,8 @@ func susocksHandler(responseWriter http.ResponseWriter, request *http.Request) {
 		log.Print("upgrade:", err)
 		return
 	}
+	c.SetCompressionLevel(6)
+	c.EnableWriteCompression(true)
 	s, err := susocks.New(&susocks.Config{})
 	if err != nil {
 		log.Print(err.Error())
@@ -66,10 +68,17 @@ type SConn struct {
 
 func (conn SConn) Read(b []byte) (n int, err error) {
 	//log.Print("(conn SConn) Read(b []byte)")
-	_, message, err := conn.Conn.ReadMessage()
+	mt, message, err := conn.Conn.ReadMessage()
 	if err != nil {
 		log.Print(err.Error())
 		return 0, err
+	}
+	if mt == websocket.PingMessage {
+		err = conn.Conn.WriteMessage(websocket.PongMessage, nil)
+		if err != nil {
+			log.Print(err.Error())
+		}
+		return conn.Read(b)
 	}
 	//log.Print("read message:",message)
 	for i, m := range message {

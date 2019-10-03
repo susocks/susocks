@@ -11,10 +11,11 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 )
 
 const (
-	IDLE = 6
+	WORKERS = 6
 )
 
 var addr = flag.String("url", "wss://susocks.if.run/susocks", "susocks url")
@@ -64,7 +65,7 @@ type ConnPool struct {
 
 func NewConnPool(url2 *url.URL) *ConnPool {
 	pool := &ConnPool{Conns: []*websocket.Conn{}, mutex: new(sync.Mutex), u: url2}
-	for i := 0; i < 10; i++ {
+	for i := 0; i < WORKERS; i++ {
 		go pool.NewConn()
 	}
 	return pool
@@ -76,6 +77,7 @@ func (connPool *ConnPool) Popup() *websocket.Conn {
 		connPool.mutex.Unlock()
 		conn, err := NewConn(connPool.u)
 		if err != nil {
+			log.Print("NewConn Failed :", err.Error())
 			return nil
 		}
 		return conn
@@ -106,6 +108,17 @@ func NewConn(u *url.URL) (*websocket.Conn, error) {
 		log.Print("dial:", err.Error())
 		return nil, err
 	}
+	c.SetCompressionLevel(6)
+	c.EnableWriteCompression(true)
+	go func() {
+		for {
+			time.Sleep(time.Second * 10)
+			err := c.WriteMessage(websocket.PingMessage, nil)
+			if err != nil {
+				return
+			}
+		}
+	}()
 	return c, nil
 }
 
@@ -137,11 +150,14 @@ func process(c *websocket.Conn, conn net.Conn) {
 	}()
 	go func() {
 		for {
-			_, data, err := c.ReadMessage()
+			mt, data, err := c.ReadMessage()
 			if err != nil {
 				cancelFunc()
 				log.Print(err.Error())
 				return
+			}
+			if mt == websocket.PongMessage {
+				continue
 			}
 			select {
 			case scChan <- data:
