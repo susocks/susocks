@@ -53,7 +53,7 @@ func main() {
 		}
 
 		//create goroutine for each connect
-		go process(connPoll.Popup(), conn)
+		go process(connPoll, conn)
 	}
 }
 
@@ -89,14 +89,18 @@ func (connPool *ConnPool) Popup() *websocket.Conn {
 	return first
 }
 
+func (connPool *ConnPool) Put(conn *websocket.Conn) {
+	connPool.mutex.Lock()
+	connPool.Conns = append(connPool.Conns, c)
+	connPool.mutex.Unlock()
+}
+
 func (connPool *ConnPool) NewConn() error {
 	c, err := NewConn(connPool.u)
 	if err != nil {
 		return err
 	}
-	connPool.mutex.Lock()
-	connPool.Conns = append(connPool.Conns, c)
-	connPool.mutex.Unlock()
+	connPool.Put(c)
 	return nil
 }
 
@@ -122,7 +126,8 @@ func NewConn(u *url.URL) (*websocket.Conn, error) {
 	return c, nil
 }
 
-func process(c *websocket.Conn, conn net.Conn) {
+func process(connPool *ConnPool, conn net.Conn) {
+	c := connPool.Popup()
 	if c == nil {
 		log.Print("websocket.Conn is nil")
 		conn.Close()
