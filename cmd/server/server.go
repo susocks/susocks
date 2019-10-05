@@ -89,11 +89,7 @@ func (connPool *ConnPool) Put(conn *websocket.Conn) {
 	connPool.Conns[conn] = struct{}{}
 	connPool.mutex.Unlock()
 }
-func (connPool *ConnPool) Send(addr2 string, data []byte) error {
-	pack := &model.Pack{
-		Addr: addr2,
-		Data: data,
-	}
+func (connPool *ConnPool) Send(pack *model.Pack) error {
 	message, err := proto.Marshal(pack)
 	if err != nil {
 		log.Print(err.Error())
@@ -150,7 +146,7 @@ func (connPool *ConnPool) ServeWebSocks(conn *websocket.Conn) error {
 				log.Print(err.Error())
 				continue
 			}
-			log.Print("got user req:", message.Addr, message.Data)
+			log.Print("got user req:", message.Addr)
 			connPool.mutex.Lock()
 			ch, ok := connPool.Socks[message.Addr]
 			connPool.mutex.Unlock()
@@ -185,6 +181,7 @@ func NewSocks(connPool *ConnPool, addr string, ch chan []byte, remoteAddr net.Ad
 		addr:       addr,
 		connPool:   connPool,
 		userChan:   ch,
+		mutex:      new(sync.Mutex),
 	}
 	socks.ctx, socks.cancanFunc = context.WithCancel(context.Background())
 	return socks
@@ -197,6 +194,8 @@ type Socks struct {
 	userChan   chan []byte
 	ctx        context.Context
 	cancanFunc context.CancelFunc
+	index      int64
+	mutex      *sync.Mutex
 }
 
 func (socks *Socks) Read(b []byte) (n int, err error) {
@@ -213,9 +212,21 @@ func (socks *Socks) Read(b []byte) (n int, err error) {
 	}
 }
 
+func (socks *Socks) Index() int64 {
+	socks.mutex.Lock()
+	defer socks.mutex.Unlock()
+	i := socks.index
+	socks.index += 1
+	return i
+}
+
 func (socks *Socks) Write(b []byte) (n int, err error) {
-	//log.Print("(socks Socks) Write(b []byte)")
-	err = socks.connPool.Send(socks.addr, b)
+	pack := &model.Pack{
+		Addr:  socks.addr,
+		Data:  b,
+		Index: socks.Index(),
+	}
+	err = socks.connPool.Send(pack)
 	if err != nil {
 		return 0, err
 	}
@@ -223,7 +234,12 @@ func (socks *Socks) Write(b []byte) (n int, err error) {
 }
 
 func (socks *Socks) Close() error {
-	err := socks.connPool.Send(socks.addr, []byte{})
+	pack := &model.Pack{
+		Addr:  socks.addr,
+		Data:  []byte{},
+		Index: socks.Index(),
+	}
+	err := socks.connPool.Send(pack)
 	if err != nil {
 		log.Print(err.Error())
 	}

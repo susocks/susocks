@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/golang/protobuf/proto"
 	"github.com/gorilla/websocket"
+	"github.com/susocks/susocks"
 	"github.com/susocks/susocks/model"
 	"log"
 	"net"
@@ -62,7 +63,7 @@ type ConnPool struct {
 	u               *url.URL
 	Conns           map[*websocket.Conn]struct{}
 	mutex           *sync.Mutex
-	UserWriteChans  map[string]chan []byte
+	UserWriteChans  map[string]chan model.Pack
 	ServerReadChan  chan model.Pack
 	ServerWriteChan chan model.Pack
 }
@@ -72,7 +73,7 @@ func NewConnPool(url2 *url.URL) *ConnPool {
 		Conns:           make(map[*websocket.Conn]struct{}),
 		mutex:           new(sync.Mutex),
 		u:               url2,
-		UserWriteChans:  make(map[string]chan []byte),
+		UserWriteChans:  make(map[string]chan model.Pack),
 		ServerReadChan:  make(chan model.Pack, 10),
 		ServerWriteChan: make(chan model.Pack, 10),
 	}
@@ -88,13 +89,13 @@ func NewConnPool(url2 *url.URL) *ConnPool {
 			select {
 			case data := <-connPool.ServerReadChan:
 				//log.Print("got server resp:", data.Addr, data.Data)
-				go func() {
+				func() {
 					connPool.mutex.Lock()
 					ch, ok := connPool.UserWriteChans[data.Addr]
 					connPool.mutex.Unlock()
 					if ok {
 						select {
-						case ch <- data.Data:
+						case ch <- data:
 						case <-time.After(time.Second * 5):
 						}
 					}
@@ -129,7 +130,7 @@ func (connPool *ConnPool) NewConn(u *url.URL, connPoolID string) (*websocket.Con
 	}
 	c.EnableWriteCompression(true)
 	ctx, cancelFunc := context.WithCancel(context.Background())
-	go func() { // write
+	go func() { // server write
 		for {
 			select {
 			case <-ctx.Done():
@@ -158,7 +159,7 @@ func (connPool *ConnPool) NewConn(u *url.URL, connPoolID string) (*websocket.Con
 			}
 		}
 	}()
-	go func() { // read
+	go func() { // server read
 		for {
 			mt, data, err := c.ReadMessage()
 			if err != nil {
@@ -190,16 +191,17 @@ func (connPool *ConnPool) NewConn(u *url.URL, connPoolID string) (*websocket.Con
 	return c, nil
 }
 
-func (connPool *ConnPool) Listen(addr2 string, scChan chan []byte) {
+func (connPool *ConnPool) Listen(addr2 string, scChan chan model.Pack) {
 	connPool.mutex.Lock()
 	connPool.UserWriteChans[addr2] = scChan
 	connPool.mutex.Unlock()
 }
 
-func (connPool *ConnPool) Send(addr2 net.Addr, data []byte) error {
+func (connPool *ConnPool) Send(addr2 net.Addr, index int64, data []byte) error {
 	pack := model.Pack{
-		Addr: addr2.String(),
-		Data: data,
+		Addr:  addr2.String(),
+		Index: index,
+		Data:  data,
 	}
 	select {
 	case connPool.ServerWriteChan <- pack:
@@ -209,34 +211,41 @@ func (connPool *ConnPool) Send(addr2 net.Addr, data []byte) error {
 	return nil
 }
 
-//func handleSocks5Header(conn net.Conn)err{
-//	// Read the version byte
-//	version := []byte{0}
-//	if _, err := conn.Read(version); err != nil {
-//		log.Printf("[ERR] socks: Failed to get version byte: %v", err)
-//	}
-//	log.Print("version",version)
-//	// Ensure we are compatible
-//	if version[0] != susocks.Socks5Version {
-//		err := fmt.Errorf("Unsupported SOCKS version: %v", version)
-//		log.Printf("[ERR] socks: %v", err)
-//	}
-//
-//	// Authenticate the connection
-//	authContext, err := s.authenticate(socks, bufConn)
-//	if err != nil {
-//		err = fmt.Errorf("Failed to authenticate: %v", err)
-//		s.config.Logger.Printf("[ERR] socks: %v", err)
-//		return err
-//	}
-//}
+func handleSocks5Header(conn net.Conn) error {
+	// Read the version byte
+	version := []byte{0}
+	if _, err := conn.Read(version); err != nil {
+		log.Printf("[ERR] socks: Failed to get version byte: %v", err)
+	}
+	// Ensure we are compatible
+	if version[0] != susocks.Socks5Version {
+		err := fmt.Errorf("Unsupported SOCKS version: %v", version)
+		log.Printf("[ERR] socks: %v", err)
+	}
+	_, err := susocks.ReadMethods(conn)
+	if err != nil {
+		return err
+	}
+	_, err = conn.Write([]byte{susocks.Socks5Version, susocks.NoAuth})
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
 func process(connPool *ConnPool, conn net.Conn) {
 	log.Print("new request from ", conn.RemoteAddr())
-
+	err := handleSocks5Header(conn)
+	if err != nil {
+		log.Print(err.Error())
+		return
+	}
+	var serverWriteIndex int64
+	var serverReadExpectIndex int64
+	ServerReadWaitMap := make(map[int64]*model.Pack)
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	csChan := make(chan []byte, 1)
-	scChan := make(chan []byte, 1)
+	scChan := make(chan model.Pack, 1)
 	connPool.Listen(conn.RemoteAddr().String(), scChan)
 	go func() { // user -> csChan
 		for {
@@ -259,23 +268,33 @@ func process(connPool *ConnPool, conn net.Conn) {
 		for {
 			select {
 			case <-ctx.Done():
-				connPool.Send(conn.RemoteAddr(), []byte{})
+				connPool.Send(conn.RemoteAddr(), serverWriteIndex, []byte{})
 				conn.Close()
 				return
 			case data := <-csChan:
-				err := connPool.Send(conn.RemoteAddr(), data)
+				err := connPool.Send(conn.RemoteAddr(), serverWriteIndex, data)
 				if err != nil {
 					cancelFunc()
 					log.Print(err.Error())
 					return
 				}
+				serverWriteIndex += 1
 			case data := <-scChan:
-				//log.Print("got server resp:",data)
-				_, err := conn.Write(data)
-				if err != nil {
-					cancelFunc()
-					log.Print(err.Error())
-					return
+				ServerReadWaitMap[data.Index] = &data
+				for {
+					pack, ok := ServerReadWaitMap[serverReadExpectIndex]
+					if ok {
+						delete(ServerReadWaitMap, serverReadExpectIndex)
+						serverReadExpectIndex += 1
+						_, err := conn.Write(pack.Data)
+						if err != nil {
+							cancelFunc()
+							log.Print(err.Error())
+							return
+						}
+					} else {
+						break
+					}
 				}
 			}
 		}
