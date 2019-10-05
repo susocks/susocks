@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -58,23 +59,26 @@ func main() {
 }
 
 type ConnPool struct {
-	u          *url.URL
-	Conns      map[*websocket.Conn]struct{}
-	mutex      *sync.Mutex
-	UserChans  map[string]chan []byte
-	ServerChan chan model.Pack
+	u               *url.URL
+	Conns           map[*websocket.Conn]struct{}
+	mutex           *sync.Mutex
+	UserWriteChans  map[string]chan []byte
+	ServerReadChan  chan model.Pack
+	ServerWriteChan chan model.Pack
 }
 
 func NewConnPool(url2 *url.URL) *ConnPool {
 	connPool := &ConnPool{
-		Conns:      make(map[*websocket.Conn]struct{}),
-		mutex:      new(sync.Mutex),
-		u:          url2,
-		UserChans:  make(map[string]chan []byte),
-		ServerChan: make(chan model.Pack, 10),
+		Conns:           make(map[*websocket.Conn]struct{}),
+		mutex:           new(sync.Mutex),
+		u:               url2,
+		UserWriteChans:  make(map[string]chan []byte),
+		ServerReadChan:  make(chan model.Pack, 10),
+		ServerWriteChan: make(chan model.Pack, 10),
 	}
+	connPoolID := time.Now().UnixNano()
 	for i := 0; i < *worker; i++ {
-		_, err := connPool.NewConn(url2)
+		_, err := connPool.NewConn(url2, strconv.FormatInt(connPoolID, 10))
 		if err != nil {
 			log.Print(err.Error())
 		}
@@ -82,10 +86,11 @@ func NewConnPool(url2 *url.URL) *ConnPool {
 	go func() {
 		for {
 			select {
-			case data := <-connPool.ServerChan:
+			case data := <-connPool.ServerReadChan:
+				//log.Print("got server resp:", data.Addr, data.Data)
 				go func() {
 					connPool.mutex.Lock()
-					ch, ok := connPool.UserChans[data.Addr]
+					ch, ok := connPool.UserWriteChans[data.Addr]
 					connPool.mutex.Unlock()
 					if ok {
 						select {
@@ -106,36 +111,62 @@ func (connPool *ConnPool) Put(conn *websocket.Conn) {
 	connPool.mutex.Unlock()
 }
 
-func (connPool *ConnPool) NewConn(u *url.URL) (*websocket.Conn, error) {
+func (connPool *ConnPool) NewConn(u *url.URL, connPoolID string) (*websocket.Conn, error) {
 	log.Printf("connecting to %s", u.String())
 	c, _, err := websocket.DefaultDialer.Dial(u.String(),
-		http.Header{"Authorization": []string{"Basic " + base64.StdEncoding.EncodeToString([]byte(*basicAuth))}})
+		http.Header{
+			"Authorization": []string{"Basic " + base64.StdEncoding.EncodeToString([]byte(*basicAuth))},
+			"Connpoolid":    []string{connPoolID},
+		})
 	if err != nil {
 		log.Print("dial:", err.Error())
 		return nil, err
 	}
+	log.Printf("connected to %s", u.String())
 	err = c.SetCompressionLevel(6)
 	if err != nil {
 		log.Print("SetCompressionLevel:", err.Error())
 	}
 	c.EnableWriteCompression(true)
-	go func() {
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	go func() { // write
 		for {
-			time.Sleep(time.Second * 10)
-			err := c.WriteMessage(websocket.PingMessage, nil)
-			if err != nil {
+			select {
+			case <-ctx.Done():
+				connPool.mutex.Lock()
+				delete(connPool.Conns, c)
+				connPool.mutex.Unlock()
 				return
+			case pack := <-connPool.ServerWriteChan:
+				data, err := proto.Marshal(&pack)
+				if err != nil {
+					log.Print(err.Error())
+					continue
+				}
+				err = c.WriteMessage(websocket.BinaryMessage, data)
+				if err != nil {
+					log.Print(err.Error())
+					continue
+				}
+			case <-time.After(time.Second * 30):
+				err = c.WriteMessage(websocket.PingMessage, nil)
+				if err != nil {
+					log.Print(err.Error())
+					continue
+				}
+
 			}
 		}
 	}()
-	go func() {
+	go func() { // read
 		for {
 			mt, data, err := c.ReadMessage()
 			if err != nil {
 				log.Print(err.Error())
-				delete(connPool.Conns, c)
+				cancelFunc()
 				return
 			}
+			//log.Print("got server data:", mt, data)
 			switch mt {
 			case websocket.PingMessage, websocket.PongMessage:
 			case websocket.BinaryMessage:
@@ -145,10 +176,10 @@ func (connPool *ConnPool) NewConn(u *url.URL) (*websocket.Conn, error) {
 					log.Print(err.Error())
 					continue
 				}
-				connPool.ServerChan <- message
+				connPool.ServerReadChan <- message
 			case websocket.CloseMessage:
 				log.Print(err.Error())
-				delete(connPool.Conns, c)
+				cancelFunc()
 				return
 			default:
 				log.Print("unkown mt:")
@@ -160,49 +191,49 @@ func (connPool *ConnPool) NewConn(u *url.URL) (*websocket.Conn, error) {
 }
 
 func (connPool *ConnPool) Listen(addr2 string, scChan chan []byte) {
-	connPool.UserChans[addr2] = scChan
-}
-
-func (connPool *ConnPool) RandWorker() *websocket.Conn {
 	connPool.mutex.Lock()
-	for conn := range connPool.Conns {
-		connPool.mutex.Unlock()
-		return conn
-	}
+	connPool.UserWriteChans[addr2] = scChan
 	connPool.mutex.Unlock()
-	c, err := connPool.NewConn(connPool.u)
-	if err != nil {
-		log.Print(err.Error())
-		time.Sleep(time.Second)
-		return connPool.RandWorker()
-	}
-	return c
 }
 
 func (connPool *ConnPool) Send(addr2 net.Addr, data []byte) error {
-	pack := &model.Pack{
+	pack := model.Pack{
 		Addr: addr2.String(),
 		Data: data,
 	}
-	message, err := proto.Marshal(pack)
-	if err != nil {
-		log.Print(err.Error())
-		return err
-	}
-	conn := connPool.RandWorker()
-	if conn == nil { // TODO: get alive connect
-		return errors.New("conn is not alive")
-	}
-	err = conn.WriteMessage(websocket.BinaryMessage, message)
-	if err != nil {
-		log.Print(err.Error())
-		return err
+	select {
+	case connPool.ServerWriteChan <- pack:
+	case <-time.After(time.Second * 10):
+		return errors.New("timeout")
 	}
 	return nil
 }
 
+//func handleSocks5Header(conn net.Conn)err{
+//	// Read the version byte
+//	version := []byte{0}
+//	if _, err := conn.Read(version); err != nil {
+//		log.Printf("[ERR] socks: Failed to get version byte: %v", err)
+//	}
+//	log.Print("version",version)
+//	// Ensure we are compatible
+//	if version[0] != susocks.Socks5Version {
+//		err := fmt.Errorf("Unsupported SOCKS version: %v", version)
+//		log.Printf("[ERR] socks: %v", err)
+//	}
+//
+//	// Authenticate the connection
+//	authContext, err := s.authenticate(socks, bufConn)
+//	if err != nil {
+//		err = fmt.Errorf("Failed to authenticate: %v", err)
+//		s.config.Logger.Printf("[ERR] socks: %v", err)
+//		return err
+//	}
+//}
+
 func process(connPool *ConnPool, conn net.Conn) {
-	log.Print("got request from ", conn.RemoteAddr())
+	log.Print("new request from ", conn.RemoteAddr())
+
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	csChan := make(chan []byte, 1)
 	scChan := make(chan []byte, 1)
@@ -216,6 +247,7 @@ func process(connPool *ConnPool, conn net.Conn) {
 				log.Print(err)
 				return
 			}
+			//log.Print("got user req:", conn.RemoteAddr().String(), data[:n])
 			select {
 			case csChan <- data[:n]:
 			case <-ctx.Done():
@@ -238,6 +270,7 @@ func process(connPool *ConnPool, conn net.Conn) {
 					return
 				}
 			case data := <-scChan:
+				//log.Print("got server resp:",data)
 				_, err := conn.Write(data)
 				if err != nil {
 					cancelFunc()

@@ -117,7 +117,7 @@ func (s *Server) Serve(l net.Listener) error {
 }
 
 // ServeConn is used to serve a single connection.
-func (s *Server) ServeConn(conn SuConner) error {
+func (s *Server) ServeConn(conn Socks) error {
 	defer conn.Close()
 	bufConn := bufio.NewReader(conn)
 
@@ -145,19 +145,19 @@ func (s *Server) ServeConn(conn SuConner) error {
 	request, err := NewRequest(bufConn)
 	if err != nil {
 		if err == unrecognizedAddrType {
-			if err := sendReply(conn, addrTypeNotSupported, nil); err != nil {
+			if err := sendReply(socks, addrTypeNotSupported, nil); err != nil {
 				return fmt.Errorf("Failed to send reply: %v", err)
 			}
 		}
 		return fmt.Errorf("Failed to read destination address: %v", err)
 	}
 	request.AuthContext = authContext
-	if client, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+	if client, ok := socks.RemoteAddr().(*net.TCPAddr); ok {
 		request.RemoteAddr = &AddrSpec{IP: client.IP, Port: client.Port}
 	}
 
 	// Process the client request
-	err = s.handleRequest(request, conn)
+	err = s.handleRequest(request, socks)
 	if err != nil {
 		err = fmt.Errorf("Failed to handle request: %v", err)
 		s.config.Logger.Printf("[ERR] socks: %v", err)
@@ -166,7 +166,7 @@ func (s *Server) ServeConn(conn SuConner) error {
 	return nil
 }
 
-type SuConner interface {
+type Socks interface {
 	Read(b []byte) (n int, err error)
 	Write(b []byte) (n int, err error)
 	Close() error
