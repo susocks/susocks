@@ -117,30 +117,9 @@ func (s *Server) Serve(l net.Listener) error {
 }
 
 // ServeConn is used to serve a single connection.
-func (s *Server) ServeConn(conn Socks) error {
-	defer conn.Close()
-	bufConn := bufio.NewReader(conn)
-
-	// Read the version byte
-	version := []byte{0}
-	if _, err := bufConn.Read(version); err != nil {
-		s.config.Logger.Printf("[ERR] socks: Failed to get version byte: %v", err)
-		return err
-	}
-	// Ensure we are compatible
-	if version[0] != Socks5Version {
-		err := fmt.Errorf("Unsupported SOCKS version: %v", version)
-		s.config.Logger.Printf("[ERR] socks: %v", err)
-		return err
-	}
-
-	// Authenticate the connection
-	authContext, err := s.authenticate(conn, bufConn)
-	if err != nil {
-		err = fmt.Errorf("Failed to authenticate: %v", err)
-		s.config.Logger.Printf("[ERR] socks: %v", err)
-		return err
-	}
+func (s *Server) ServeConn(socks Socks) error {
+	defer socks.Close()
+	bufConn := bufio.NewReader(socks)
 
 	request, err := NewRequest(bufConn)
 	if err != nil {
@@ -151,7 +130,7 @@ func (s *Server) ServeConn(conn Socks) error {
 		}
 		return fmt.Errorf("Failed to read destination address: %v", err)
 	}
-	request.AuthContext = authContext
+	request.AuthContext = &AuthContext{NoAuth, nil}
 	if client, ok := socks.RemoteAddr().(*net.TCPAddr); ok {
 		request.RemoteAddr = &AddrSpec{IP: client.IP, Port: client.Port}
 	}

@@ -4,5 +4,6 @@ package model;
 
 message Pack {
     string addr = 1;
-    bytes data = 2;
+    int64 index = 2;
+    bytes data = 3;
 }
