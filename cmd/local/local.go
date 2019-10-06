@@ -18,7 +18,7 @@ const (
 	WORKERS = 6
 )
 
-var addr = flag.String("url", "wss://susocks.if.run/susocks", "susocks url")
+var addr = flag.String("url", "ws://localhost:8080/susocks", "susocks url")
 var bind = flag.String("bind", "127.0.0.1:1080", "socks5 bind ip:port")
 var basicAuth = flag.String("auth", "user:password", "basic auth")
 
@@ -91,7 +91,7 @@ func (connPool *ConnPool) Popup() *websocket.Conn {
 
 func (connPool *ConnPool) Put(conn *websocket.Conn) {
 	connPool.mutex.Lock()
-	connPool.Conns = append(connPool.Conns, c)
+	connPool.Conns = append(connPool.Conns, conn)
 	connPool.mutex.Unlock()
 }
 

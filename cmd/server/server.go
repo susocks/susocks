@@ -16,7 +16,7 @@ func init() {
 }
 
 var rAddr net.Addr
-var addr = flag.String("addr", "0.0.0.0:80", "http service address")
+var addr = flag.String("addr", "0.0.0.0:8080", "http service address")
 var basicAuth = flag.String("auth", "user:password", "basic auth")
 
 func main() {
