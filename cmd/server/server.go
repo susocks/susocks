@@ -85,47 +85,62 @@ func NewWSPool(id string) *WSPool {
 	}
 }
 
-func (connPool *WSPool) Put(conn *websocket.Conn) {
-	connPool.mutex.Lock()
-	connPool.WSs[conn] = struct{}{}
-	connPool.mutex.Unlock()
+func (wsPool *WSPool) Put(conn *websocket.Conn) {
+	wsPool.mutex.Lock()
+	wsPool.WSs[conn] = struct{}{}
+	wsPool.mutex.Unlock()
 }
-func (connPool *WSPool) Send(pack *model.Pack) error {
+
+func (wsPool *WSPool) Remove(conn *websocket.Conn) {
+	wsPool.mutex.Lock()
+	delete(wsPool.WSs, conn)
+	if len(wsPool.WSs) == 0 {
+		poolMapMutex.Lock()
+		delete(poolMap, wsPool.ID)
+		poolMapMutex.Unlock()
+	}
+	wsPool.mutex.Unlock()
+}
+
+func (wsPool *WSPool) Send(pack *model.Pack) error {
 	message, err := proto.Marshal(pack)
 	if err != nil {
 		log.Print(err.Error())
 		return err
 	}
 	select {
-	case connPool.ServerWriteChan <- message:
+	case wsPool.ServerWriteChan <- message:
 	case <-time.After(time.Second * 10):
 	}
 	return nil
 }
 
-func (connPool *WSPool) susocksHandler(responseWriter http.ResponseWriter, request *http.Request) {
+func (wsPool *WSPool) susocksHandler(responseWriter http.ResponseWriter, request *http.Request) {
 	ws := &websocket.Upgrader{}
 	c, err := ws.Upgrade(responseWriter, request, nil)
 	if err != nil {
 		log.Print("upgrade:", err)
 		return
 	}
-	defer c.Close()
+	defer func() {
+		c.Close()
+		wsPool.Remove(c)
+	}()
 	c.SetCompressionLevel(6)
 	c.EnableWriteCompression(true)
-	connPool.Put(c)
-	err = connPool.ServeWebSocks(c)
+	wsPool.Put(c)
+	err = wsPool.ServeWebSocks(c)
 	if err != nil {
 		log.Print(err.Error())
 		return
 	}
 }
 
-func (connPool *WSPool) ServeWebSocks(ws *websocket.Conn) error {
+func (wsPool *WSPool) ServeWebSocks(ws *websocket.Conn) error {
 	go func() {
 		for {
 			select {
-			case message := <-connPool.ServerWriteChan:
+			case message := <-wsPool.ServerWriteChan:
 				err := ws.WriteMessage(websocket.BinaryMessage, message)
 				if err != nil {
 					log.Print(err.Error())
@@ -153,22 +168,22 @@ func (connPool *WSPool) ServeWebSocks(ws *websocket.Conn) error {
 				log.Print(err.Error())
 				continue
 			}
-			connPool.mutex.Lock()
-			ch, ok := connPool.WSReadChan[message.Addr]
+			wsPool.mutex.Lock()
+			ch, ok := wsPool.WSReadChan[message.Addr]
 			if !ok {
 				log.Print("got user req:", message.Addr)
 				ch = make(chan model.Pack)
-				socks := NewSocks(connPool, message.Addr, ch, ws.RemoteAddr())
+				socks := NewSocks(wsPool, message.Addr, ch, ws.RemoteAddr())
 				conf, err := susocks.New(&susocks.Config{})
 				if err != nil {
 					log.Print(err.Error())
 					continue
 				}
-				connPool.WSReadChan[message.Addr] = ch
+				wsPool.WSReadChan[message.Addr] = ch
 				go conf.ServeConn(socks)
 				log.Print("got ws pack from:", message.Addr)
 			}
-			connPool.mutex.Unlock()
+			wsPool.mutex.Unlock()
 			go func() {
 				select {
 				case <-time.After(time.Second * 5):
