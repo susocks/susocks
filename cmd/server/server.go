@@ -42,7 +42,6 @@ func main() {
 
 func handler(responseWriter http.ResponseWriter, request *http.Request) {
 	log.Print("got connect from ", request.RemoteAddr)
-	log.Print(request.Header)
 	auths := request.Header["Authorization"]
 	if len(auths) != 1 || auths[0] != "Basic "+base64.StdEncoding.EncodeToString([]byte(*basicAuth)) {
 		log.Print("auth failed")
@@ -50,7 +49,7 @@ func handler(responseWriter http.ResponseWriter, request *http.Request) {
 		responseWriter.Write([]byte{})
 		return
 	}
-	log.Print("auth success")
+	log.Print("connected with ", request.RemoteAddr)
 	if len(request.Header["Connpoolid"]) != 1 {
 		log.Print("Connpoolid error", request.Header["ConnPoolID"])
 		responseWriter.WriteHeader(400)
@@ -69,18 +68,20 @@ func handler(responseWriter http.ResponseWriter, request *http.Request) {
 }
 
 type ConnPool struct {
-	ID    string
-	Conns map[*websocket.Conn]struct{}
-	Socks map[string]chan []byte
-	mutex *sync.Mutex
+	ID              string
+	Conns           map[*websocket.Conn]struct{}
+	Socks           map[string]chan []byte
+	mutex           *sync.Mutex
+	ServerWriteChan chan []byte
 }
 
 func NewServe(id string) *ConnPool {
 	return &ConnPool{
-		ID:    id,
-		Conns: make(map[*websocket.Conn]struct{}),
-		Socks: make(map[string]chan []byte, 1),
-		mutex: new(sync.Mutex),
+		ID:              id,
+		Conns:           make(map[*websocket.Conn]struct{}),
+		Socks:           make(map[string]chan []byte),
+		mutex:           new(sync.Mutex),
+		ServerWriteChan: make(chan []byte, 10),
 	}
 }
 
@@ -95,15 +96,9 @@ func (connPool *ConnPool) Send(pack *model.Pack) error {
 		log.Print(err.Error())
 		return err
 	}
-	connPool.mutex.Lock()
-	defer connPool.mutex.Unlock()
-	for conn := range connPool.Conns {
-		err = conn.WriteMessage(websocket.BinaryMessage, message)
-		if err != nil {
-			log.Print(err.Error())
-			return err
-		}
-		return nil
+	select {
+	case connPool.ServerWriteChan <- message:
+	case <-time.After(time.Second * 10):
 	}
 	return nil
 }
@@ -127,6 +122,18 @@ func (connPool *ConnPool) susocksHandler(responseWriter http.ResponseWriter, req
 }
 
 func (connPool *ConnPool) ServeWebSocks(conn *websocket.Conn) error {
+	go func() {
+		for {
+			select {
+			case message := <-connPool.ServerWriteChan:
+				err := conn.WriteMessage(websocket.BinaryMessage, message)
+				if err != nil {
+					log.Print(err.Error())
+					return
+				}
+			}
+		}
+	}()
 	for {
 		mt, data, err := conn.ReadMessage()
 		if err != nil {
@@ -149,7 +156,6 @@ func (connPool *ConnPool) ServeWebSocks(conn *websocket.Conn) error {
 			log.Print("got user req:", message.Addr)
 			connPool.mutex.Lock()
 			ch, ok := connPool.Socks[message.Addr]
-			connPool.mutex.Unlock()
 			if !ok {
 				ch = make(chan []byte)
 				socks := NewSocks(connPool, message.Addr, ch, conn.RemoteAddr())
@@ -158,12 +164,11 @@ func (connPool *ConnPool) ServeWebSocks(conn *websocket.Conn) error {
 					log.Print(err.Error())
 					continue
 				}
-				connPool.mutex.Lock()
 				connPool.Socks[message.Addr] = ch
-				connPool.mutex.Unlock()
 				go conf.ServeConn(socks)
-				log.Print("got request from:", message.Addr)
+				log.Print("got websocket from:", message.Addr)
 			}
+			connPool.mutex.Unlock()
 			go func() {
 				select {
 				case <-time.After(time.Second * 5):
@@ -243,7 +248,9 @@ func (socks *Socks) Close() error {
 	if err != nil {
 		log.Print(err.Error())
 	}
+	socks.connPool.mutex.Lock()
 	delete(socks.connPool.Socks, socks.addr)
+	socks.connPool.mutex.Unlock()
 	return err
 }
 

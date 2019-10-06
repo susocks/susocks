@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"fmt"
 	"golang.org/x/net/proxy"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 )
 
 func init() {
@@ -16,8 +18,20 @@ func init() {
 }
 
 func main() {
-	id := "5d986c61ce0e9"
-	reqUrl := "http://tmp.link/d/" + id
+	waitGroup := new(sync.WaitGroup)
+	for i := 0; i < 1; i++ {
+		waitGroup.Add(1)
+		go func() {
+			sum := Fetch()
+			log.Print(sum)
+			waitGroup.Done()
+		}()
+	}
+	waitGroup.Wait()
+}
+
+func Fetch() string {
+	reqUrl := "https://gdown.baidu.com/data/wisegame/dc976e3ab67c80b0/baidushoujizhushou_16798012.apk"
 	u, err := url.Parse("socks5://localhost:1081")
 	if err != nil {
 		log.Fatal(err)
@@ -54,10 +68,10 @@ func main() {
 		log.Fatal(err)
 	}
 	md5sum := md5.Sum(data)
-	log.Print(resp.Header)
-	log.Printf("%x", md5sum)
-	log.Print("6be0e7d86e4b2a5c7e2b43ed56b74463")
-	log.Printf("%s", data[:256])
+	//log.Print(resp.Header)
+	return fmt.Sprintf("%x", md5sum)
+	//log.Print("6be0e7d86e4b2a5c7e2b43ed56b74463")
+	//log.Printf("%s", data[:256])
 	//log.Printf("%x")
 }
 
