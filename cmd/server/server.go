@@ -207,30 +207,26 @@ type Socks struct {
 }
 
 func (socks *Socks) Read(b []byte) (n int, err error) {
+	msg, ok := socks.ServerReadWaitMap[socks.wsReadIndex]
+	if ok {
+		delete(socks.ServerReadWaitMap, socks.wsReadIndex)
+		socks.wsReadIndex += 1
+		for i, m := range msg.Data {
+			b[i] = m
+		}
+		return len(msg.Data), nil
+	}
 	select {
 	case <-socks.ctx.Done():
 		return 0, io.EOF
 	case <-time.After(time.Minute):
 		return 0, io.EOF
-	case message := <-socks.userChan: // todo: index
+	case message := <-socks.userChan:
 		if len(message.Data) == 0 {
 			return 0, io.EOF
 		}
 		socks.ServerReadWaitMap[message.Index] = message
-		for {
-			msg, ok := socks.ServerReadWaitMap[socks.wsReadIndex]
-			if !ok {
-				break
-			}
-			log.Print("socks.wsReadIndex: ", msg.Index, msg.Md5)
-			socks.wsReadIndex += 1
-			for i, m := range msg.Data {
-				b[i] = m
-			}
-			return len(msg.Data), nil
-		}
-		// todo: close len==0
-		return len(message.Data), nil
+		return socks.Read(b)
 	}
 }
 
