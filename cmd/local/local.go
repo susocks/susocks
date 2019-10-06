@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -60,22 +61,22 @@ func main() {
 }
 
 type WSPool struct {
-	u               *url.URL
-	WSs             map[*websocket.Conn]struct{}
-	mutex           *sync.Mutex
-	UserWriteChans  map[string]chan model.Pack
-	ServerReadChan  chan model.Pack
-	ServerWriteChan chan model.Pack
+	u              *url.URL
+	WSs            map[*websocket.Conn]struct{}
+	mutex          *sync.Mutex
+	UserWriteChans map[string]chan model.Pack
+	WSReadChan     chan model.Pack
+	WSWriteChan    chan model.Pack
 }
 
 func NewWSPool(url2 *url.URL) *WSPool {
 	wsPool := &WSPool{
-		WSs:             make(map[*websocket.Conn]struct{}),
-		mutex:           new(sync.Mutex),
-		u:               url2,
-		UserWriteChans:  make(map[string]chan model.Pack),
-		ServerReadChan:  make(chan model.Pack, 10),
-		ServerWriteChan: make(chan model.Pack, 10),
+		WSs:            make(map[*websocket.Conn]struct{}),
+		mutex:          new(sync.Mutex),
+		u:              url2,
+		UserWriteChans: make(map[string]chan model.Pack),
+		WSReadChan:     make(chan model.Pack, 10),
+		WSWriteChan:    make(chan model.Pack, 10),
 	}
 	connPoolID := time.Now().UnixNano()
 	for i := 0; i < *worker; i++ {
@@ -87,7 +88,7 @@ func NewWSPool(url2 *url.URL) *WSPool {
 	go func() {
 		for {
 			select {
-			case data := <-wsPool.ServerReadChan:
+			case data := <-wsPool.WSReadChan:
 				//log.Print("got server resp:", data.Addr, data.Data)
 				func() {
 					wsPool.mutex.Lock()
@@ -138,12 +139,13 @@ func (wsPoll *WSPool) NewConn(u *url.URL, connPoolID string) (*websocket.Conn, e
 				delete(wsPoll.WSs, c)
 				wsPoll.mutex.Unlock()
 				return
-			case pack := <-wsPoll.ServerWriteChan:
+			case pack := <-wsPoll.WSWriteChan:
 				data, err := proto.Marshal(&pack)
 				if err != nil {
 					log.Print(err.Error())
 					continue
 				}
+				log.Print("WSWriteIndex:", pack.Index, pack.Md5)
 				err = c.WriteMessage(websocket.BinaryMessage, data)
 				if err != nil {
 					log.Print(err.Error())
@@ -177,7 +179,7 @@ func (wsPoll *WSPool) NewConn(u *url.URL, connPoolID string) (*websocket.Conn, e
 					log.Print(err.Error())
 					continue
 				}
-				wsPoll.ServerReadChan <- message
+				wsPoll.WSReadChan <- message
 			case websocket.CloseMessage:
 				log.Print(err.Error())
 				cancelFunc()
@@ -202,9 +204,10 @@ func (wsPoll *WSPool) Send(addr2 net.Addr, index int64, data []byte) error {
 		Addr:  addr2.String(),
 		Index: index,
 		Data:  data,
+		Md5:   fmt.Sprintf("%x", md5.Sum(data)),
 	}
 	select {
-	case wsPoll.ServerWriteChan <- pack:
+	case wsPoll.WSWriteChan <- pack:
 	case <-time.After(time.Second * 10):
 		return errors.New("timeout")
 	}
@@ -240,9 +243,9 @@ func ProcessUserConn(wsPool *WSPool, userConn net.Conn) {
 		log.Print(err.Error())
 		return
 	}
-	var serverWriteIndex int64
-	var serverReadExpectIndex int64
-	ServerReadWaitMap := make(map[int64]*model.Pack)
+	var WSWriteIndex int64
+	var WSReadExpectIndex int64
+	WSReadWaitMap := make(map[int64]*model.Pack)
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	csChan := make(chan []byte, 1)
 	scChan := make(chan model.Pack, 1)
@@ -252,9 +255,16 @@ func ProcessUserConn(wsPool *WSPool, userConn net.Conn) {
 			data := make([]byte, 4096)
 			n, err := userConn.Read(data)
 			if err != nil {
+				log.Print("cancelFunc()", err.Error())
 				cancelFunc()
-				log.Print("userConn Closing", userConn.RemoteAddr(), err.Error())
-				return
+				log.Print("userConn Closing", userConn.RemoteAddr())
+				err = userConn.Close()
+				if err != nil {
+					log.Print("userConn Closed failed", err.Error())
+					break
+				}
+				log.Print("userConn Closed", userConn.RemoteAddr())
+				break
 			}
 			//log.Print("got user req:", userConn.RemoteAddr().String(), data[:n])
 			select {
@@ -268,32 +278,68 @@ func ProcessUserConn(wsPool *WSPool, userConn net.Conn) {
 		for {
 			select {
 			case <-ctx.Done():
-				wsPool.Send(userConn.RemoteAddr(), serverWriteIndex, []byte{})
-				userConn.Close()
+				log.Print("closing socks:", userConn.RemoteAddr())
+				err := wsPool.Send(userConn.RemoteAddr(), WSWriteIndex, []byte{})
+				if err != nil {
+					fmt.Print("close socks failed:", userConn.RemoteAddr(), err.Error())
+				}
+				log.Print("socks Closed", userConn.RemoteAddr())
+
+				log.Print("userConn Closing", userConn.RemoteAddr())
+				err = userConn.Close()
+				if err != nil {
+					log.Print("userConn Closed failed", err.Error())
+					return
+				}
 				log.Print("userConn Closed", userConn.RemoteAddr())
 				return
 			case data := <-csChan:
-				err := wsPool.Send(userConn.RemoteAddr(), serverWriteIndex, data)
+				err := wsPool.Send(userConn.RemoteAddr(), WSWriteIndex, data)
 				if err != nil {
 					cancelFunc()
-					log.Print(err.Error())
-					return
+					log.Print("cancelFunc()", err.Error())
+					log.Print("userConn Closing", userConn.RemoteAddr())
+					err = userConn.Close()
+					if err != nil {
+						log.Print("userConn Closed failed", err.Error())
+						break
+					}
+					log.Print("userConn Closed", userConn.RemoteAddr())
+					break
 				}
-				serverWriteIndex += 1
+				WSWriteIndex += 1
 			case data := <-scChan:
-				ServerReadWaitMap[data.Index] = &data
+				WSReadWaitMap[data.Index] = &data
+				if len(data.Data) == 0 {
+					cancelFunc()
+					log.Print("cancelFunc()")
+					log.Print("userConn Closing", userConn.RemoteAddr())
+					err = userConn.Close()
+					if err != nil {
+						log.Print("userConn Closed failed", err.Error())
+						break
+					}
+					log.Print("userConn Closed", userConn.RemoteAddr())
+					break
+				}
 				for {
-					pack, ok := ServerReadWaitMap[serverReadExpectIndex]
+					pack, ok := WSReadWaitMap[WSReadExpectIndex]
 					if ok {
-						delete(ServerReadWaitMap, serverReadExpectIndex)
-						serverReadExpectIndex += 1
+						delete(WSReadWaitMap, WSReadExpectIndex)
+						WSReadExpectIndex += 1
 						_, err := userConn.Write(pack.Data)
 						if err != nil {
 							cancelFunc()
-							log.Print(err.Error())
-							return
+							log.Print("cancelFunc()", err.Error())
+							break
 						}
 					} else {
+						if len(WSReadWaitMap) > 0 {
+							log.Print("expect:", WSReadExpectIndex)
+							for _, v := range WSReadWaitMap {
+								log.Print("have:", v.Index)
+							}
+						}
 						break
 					}
 				}

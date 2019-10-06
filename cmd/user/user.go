@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"golang.org/x/net/proxy"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -32,15 +34,15 @@ func main() {
 
 func Fetch() string {
 	reqUrl := "https://gdown.baidu.com/data/wisegame/dc976e3ab67c80b0/baidushoujizhushou_16798012.apk"
-	u, err := url.Parse("socks5://localhost:1081")
+	u, err := url.Parse("socks5://localhost:1080")
 	if err != nil {
 		log.Fatal(err)
 	}
 	dialer, err := proxy.FromURL(u, nil)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err, dialer)
 	}
-	c := http.Client{
+	c := &http.Client{
 		Transport: &http.Transport{
 			DialContext: DialerAddContext(dialer),
 		},
@@ -49,15 +51,15 @@ func Fetch() string {
 	if err != nil {
 		log.Fatal(err)
 	}
-	req.Header.Add("Connection", "keep-alive")
-	req.Header.Add("Pragma", "no-cache")
+	//req.Header.Add("Connection", "keep-alive")
+	//req.Header.Add("Pragma", "no-cache")
 	req.Header.Add("Cache-Control", "no-cache")
-	req.Header.Add("Upgrade-Insecure-Requests", "1")
+	//req.Header.Add("Upgrade-Insecure-Requests", "1")
 	req.Header.Add("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/76.0.3809.100 Safari/537.36")
-	req.Header.Add("DNT", "1")
+	//req.Header.Add("DNT", "1")
 	req.Header.Add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3")
-	req.Header.Add("Accept-Encoding", "gzip, deflate")
-	req.Header.Add("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6")
+	//req.Header.Add("Accept-Encoding", "gzip, deflate, br")
+	//req.Header.Add("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6")
 	resp, err := c.Do(req)
 	if err != nil {
 		log.Fatal(err)
@@ -78,5 +80,21 @@ func Fetch() string {
 func DialerAddContext(dialer proxy.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return dialer.Dial(network, addr)
+	}
+}
+
+func ReadAll(reader io.Reader) ([]byte, error) {
+	if reader == nil {
+		return []byte{}, errors.New("nil reader")
+	}
+	data := []byte{}
+	for {
+		buffer := make([]byte, 1024)
+		n, err := reader.Read(buffer)
+		if err != nil {
+			return data, nil
+		}
+		data = append(data, buffer[:n]...)
+		log.Print(len(data))
 	}
 }

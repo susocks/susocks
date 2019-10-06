@@ -24,7 +24,7 @@ func init() {
 var rAddr net.Addr
 var addr = flag.String("addr", "0.0.0.0:8080", "http service address")
 var basicAuth = flag.String("auth", "user:password", "basic auth")
-var poolMap = make(map[string]*ConnPool)
+var poolMap = make(map[string]*WSPool)
 var poolMapMutex = new(sync.Mutex)
 
 func main() {
@@ -60,37 +60,37 @@ func handler(responseWriter http.ResponseWriter, request *http.Request) {
 	poolMapMutex.Lock()
 	pool, ok := poolMap[connPoolID]
 	if !ok {
-		pool = NewServe(connPoolID)
+		pool = NewWSPool(connPoolID)
 		poolMap[connPoolID] = pool
 	}
 	poolMapMutex.Unlock()
 	pool.susocksHandler(responseWriter, request)
 }
 
-type ConnPool struct {
+type WSPool struct {
 	ID              string
-	Conns           map[*websocket.Conn]struct{}
-	Socks           map[string]chan []byte
+	WSs             map[*websocket.Conn]struct{}
+	WSReadChan      map[string]chan model.Pack
 	mutex           *sync.Mutex
 	ServerWriteChan chan []byte
 }
 
-func NewServe(id string) *ConnPool {
-	return &ConnPool{
+func NewWSPool(id string) *WSPool {
+	return &WSPool{
 		ID:              id,
-		Conns:           make(map[*websocket.Conn]struct{}),
-		Socks:           make(map[string]chan []byte),
+		WSs:             make(map[*websocket.Conn]struct{}),
+		WSReadChan:      make(map[string]chan model.Pack),
 		mutex:           new(sync.Mutex),
 		ServerWriteChan: make(chan []byte, 10),
 	}
 }
 
-func (connPool *ConnPool) Put(conn *websocket.Conn) {
+func (connPool *WSPool) Put(conn *websocket.Conn) {
 	connPool.mutex.Lock()
-	connPool.Conns[conn] = struct{}{}
+	connPool.WSs[conn] = struct{}{}
 	connPool.mutex.Unlock()
 }
-func (connPool *ConnPool) Send(pack *model.Pack) error {
+func (connPool *WSPool) Send(pack *model.Pack) error {
 	message, err := proto.Marshal(pack)
 	if err != nil {
 		log.Print(err.Error())
@@ -103,7 +103,7 @@ func (connPool *ConnPool) Send(pack *model.Pack) error {
 	return nil
 }
 
-func (connPool *ConnPool) susocksHandler(responseWriter http.ResponseWriter, request *http.Request) {
+func (connPool *WSPool) susocksHandler(responseWriter http.ResponseWriter, request *http.Request) {
 	ws := &websocket.Upgrader{}
 	c, err := ws.Upgrade(responseWriter, request, nil)
 	if err != nil {
@@ -121,12 +121,12 @@ func (connPool *ConnPool) susocksHandler(responseWriter http.ResponseWriter, req
 	}
 }
 
-func (connPool *ConnPool) ServeWebSocks(conn *websocket.Conn) error {
+func (connPool *WSPool) ServeWebSocks(ws *websocket.Conn) error {
 	go func() {
 		for {
 			select {
 			case message := <-connPool.ServerWriteChan:
-				err := conn.WriteMessage(websocket.BinaryMessage, message)
+				err := ws.WriteMessage(websocket.BinaryMessage, message)
 				if err != nil {
 					log.Print(err.Error())
 					return
@@ -135,44 +135,44 @@ func (connPool *ConnPool) ServeWebSocks(conn *websocket.Conn) error {
 		}
 	}()
 	for {
-		mt, data, err := conn.ReadMessage()
+		mt, data, err := ws.ReadMessage()
 		if err != nil {
 			log.Print(err.Error())
 			return err
 		}
 		switch mt {
 		case websocket.PingMessage:
-			err = conn.WriteMessage(websocket.PongMessage, nil)
+			err = ws.WriteMessage(websocket.PongMessage, nil)
 			if err != nil {
 				log.Print(err.Error())
 			}
 		case websocket.BinaryMessage:
-			message := model.Pack{}
-			err := proto.Unmarshal(data, &message)
+			message := &model.Pack{}
+			err := proto.Unmarshal(data, message)
 			if err != nil {
 				log.Print(err.Error())
 				continue
 			}
-			log.Print("got user req:", message.Addr)
 			connPool.mutex.Lock()
-			ch, ok := connPool.Socks[message.Addr]
+			ch, ok := connPool.WSReadChan[message.Addr]
 			if !ok {
-				ch = make(chan []byte)
-				socks := NewSocks(connPool, message.Addr, ch, conn.RemoteAddr())
+				log.Print("got user req:", message.Addr)
+				ch = make(chan model.Pack)
+				socks := NewSocks(connPool, message.Addr, ch, ws.RemoteAddr())
 				conf, err := susocks.New(&susocks.Config{})
 				if err != nil {
 					log.Print(err.Error())
 					continue
 				}
-				connPool.Socks[message.Addr] = ch
+				connPool.WSReadChan[message.Addr] = ch
 				go conf.ServeConn(socks)
-				log.Print("got websocket from:", message.Addr)
+				log.Print("got ws pack from:", message.Addr)
 			}
 			connPool.mutex.Unlock()
 			go func() {
 				select {
 				case <-time.After(time.Second * 5):
-				case ch <- message.Data:
+				case ch <- *message:
 				}
 			}()
 		}
@@ -180,48 +180,65 @@ func (connPool *ConnPool) ServeWebSocks(conn *websocket.Conn) error {
 	return nil
 }
 
-func NewSocks(connPool *ConnPool, addr string, ch chan []byte, remoteAddr net.Addr) *Socks {
+func NewSocks(connPool *WSPool, addr string, ch chan model.Pack, remoteAddr net.Addr) *Socks {
 	socks := &Socks{
-		remoteAddr: remoteAddr,
-		addr:       addr,
-		connPool:   connPool,
-		userChan:   ch,
-		mutex:      new(sync.Mutex),
+		remoteAddr:        remoteAddr,
+		addr:              addr,
+		connPool:          connPool,
+		userChan:          ch,
+		mutex:             new(sync.Mutex),
+		ServerReadWaitMap: make(map[int64]model.Pack),
 	}
 	socks.ctx, socks.cancanFunc = context.WithCancel(context.Background())
 	return socks
 }
 
 type Socks struct {
-	remoteAddr net.Addr
-	addr       string
-	connPool   *ConnPool
-	userChan   chan []byte
-	ctx        context.Context
-	cancanFunc context.CancelFunc
-	index      int64
-	mutex      *sync.Mutex
+	remoteAddr        net.Addr
+	addr              string
+	connPool          *WSPool
+	userChan          chan model.Pack
+	ctx               context.Context
+	cancanFunc        context.CancelFunc
+	wsWriteIndex      int64
+	wsReadIndex       int64
+	mutex             *sync.Mutex
+	ServerReadWaitMap map[int64]model.Pack
 }
 
 func (socks *Socks) Read(b []byte) (n int, err error) {
 	select {
 	case <-socks.ctx.Done():
 		return 0, io.EOF
-	case <-time.After(time.Minute * 5):
+	case <-time.After(time.Minute):
 		return 0, io.EOF
-	case message := <-socks.userChan:
-		for i, m := range message {
-			b[i] = m
+	case message := <-socks.userChan: // todo: index
+		if len(message.Data) == 0 {
+			return 0, io.EOF
 		}
-		return len(message), nil
+		socks.ServerReadWaitMap[message.Index] = message
+		for {
+			msg, ok := socks.ServerReadWaitMap[socks.wsReadIndex]
+			if !ok {
+				break
+			}
+			log.Print("socks.wsReadIndex: ", msg.Index, msg.Md5)
+			socks.wsReadIndex += 1
+			for i, m := range msg.Data {
+				b[i] = m
+			}
+			return len(msg.Data), nil
+		}
+		// todo: close len==0
+		return len(message.Data), nil
 	}
 }
 
-func (socks *Socks) Index() int64 {
+func (socks *Socks) WriteIndex() int64 {
 	socks.mutex.Lock()
 	defer socks.mutex.Unlock()
-	i := socks.index
-	socks.index += 1
+	i := socks.wsWriteIndex
+	socks.wsWriteIndex += 1
 	return i
 }
 
@@ -229,7 +246,7 @@ func (socks *Socks) Write(b []byte) (n int, err error) {
 	pack := &model.Pack{
 		Addr:  socks.addr,
 		Data:  b,
-		Index: socks.Index(),
+		Index: socks.WriteIndex(),
 	}
 	err = socks.connPool.Send(pack)
 	if err != nil {
@@ -242,14 +259,17 @@ func (socks *Socks) Close() error {
 	pack := &model.Pack{
 		Addr:  socks.addr,
 		Data:  []byte{},
-		Index: socks.Index(),
+		Index: socks.WriteIndex(),
 	}
+	log.Print("closing socks:", socks.RemoteAddr())
 	err := socks.connPool.Send(pack)
 	if err != nil {
 		log.Print(err.Error())
+		log.Print("close socks failed:", socks.RemoteAddr())
 	}
+	log.Print("close socks sended:", socks.RemoteAddr())
 	socks.connPool.mutex.Lock()
-	delete(socks.connPool.Socks, socks.addr)
+	delete(socks.connPool.WSReadChan, socks.addr)
 	socks.connPool.mutex.Unlock()
 	return err
 }

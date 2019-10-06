@@ -6,4 +6,5 @@ message Pack {
     string addr = 1;
     int64 index = 2;
     bytes data = 3;
+    string md5 = 4;
 }
