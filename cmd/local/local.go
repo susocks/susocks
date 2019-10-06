@@ -80,28 +80,22 @@ func NewWSPool(url2 *url.URL) *WSPool {
 	}
 	connPoolID := time.Now().UnixNano()
 	for i := 0; i < *worker; i++ {
-		_, err := wsPool.NewConn(url2, strconv.FormatInt(connPoolID, 10))
-		if err != nil {
-			log.Print(err.Error())
-		}
+		go wsPool.NewConn(url2, strconv.FormatInt(connPoolID, 10))
 	}
 	go func() {
 		for {
-			select {
-			case data := <-wsPool.WSReadChan:
-				//log.Print("got server resp:", data.Addr, data.Data)
-				func() {
-					wsPool.mutex.Lock()
-					ch, ok := wsPool.UserWriteChans[data.Addr]
-					wsPool.mutex.Unlock()
-					if ok {
-						select {
-						case ch <- data:
-						case <-time.After(time.Second * 5):
-						}
+			data := <-wsPool.WSReadChan
+			go func() {
+				wsPool.mutex.Lock()
+				ch, ok := wsPool.UserWriteChans[data.Addr]
+				wsPool.mutex.Unlock()
+				if ok {
+					select {
+					case ch <- data:
+					case <-time.After(time.Second * 5):
 					}
-				}()
-			}
+				}
+			}()
 		}
 	}()
 	return wsPool
@@ -122,6 +116,8 @@ func (wsPoll *WSPool) NewConn(u *url.URL, connPoolID string) (*websocket.Conn, e
 		})
 	if err != nil {
 		log.Print("dial:", err.Error())
+		time.Sleep(time.Second * 5)
+		go wsPoll.NewConn(u, connPoolID)
 		return nil, err
 	}
 	log.Printf("connected to %s", u.String())
@@ -138,6 +134,8 @@ func (wsPoll *WSPool) NewConn(u *url.URL, connPoolID string) (*websocket.Conn, e
 				wsPoll.mutex.Lock()
 				delete(wsPoll.WSs, c)
 				wsPoll.mutex.Unlock()
+				time.Sleep(time.Second * 5)
+				go wsPoll.NewConn(u, connPoolID)
 				return
 			case pack := <-wsPoll.WSWriteChan:
 				data, err := proto.Marshal(&pack)
@@ -157,7 +155,6 @@ func (wsPoll *WSPool) NewConn(u *url.URL, connPoolID string) (*websocket.Conn, e
 					log.Print(err.Error())
 					continue
 				}
-
 			}
 		}
 	}()
@@ -247,8 +244,8 @@ func ProcessUserConn(wsPool *WSPool, userConn net.Conn) {
 	var WSReadExpectIndex int64
 	WSReadWaitMap := make(map[int64]*model.Pack)
 	ctx, cancelFunc := context.WithCancel(context.Background())
-	csChan := make(chan []byte, 1)
-	scChan := make(chan model.Pack, 1)
+	csChan := make(chan []byte, 100)
+	scChan := make(chan model.Pack, 100)
 	wsPool.Listen(userConn.RemoteAddr().String(), scChan)
 	go func() { // user -> csChan
 		for {
@@ -334,7 +331,7 @@ func ProcessUserConn(wsPool *WSPool, userConn net.Conn) {
 							break
 						}
 					} else {
-						if len(WSReadWaitMap) > 0 {
+						if len(WSReadWaitMap) > 0 { // TODO: clean && shutdown
 							log.Print("expect:", WSReadExpectIndex)
 							for _, v := range WSReadWaitMap {
 								log.Print("have:", v.Index)
